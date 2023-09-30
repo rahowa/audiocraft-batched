@@ -38,7 +38,7 @@ We offer a number of way to interact with MusicGen:
 1. A demo is also available on the [`facebook/MusicGen` Hugging Face Space](https://huggingface.co/spaces/facebook/MusicGen)
 (huge thanks to all the HF team for their support).
 2. You can run the extended demo on a Colab:
-[colab notebook](https://colab.research.google.com/drive/1JlTOjB-G0A2Hz3h8PK63vLZk4xdCI5QB?usp=sharing)
+[colab notebook](https://colab.research.google.com/drive/1Wcld2yZLsciSw7b0FsPbhYnkN2pM5paV?usp=sharing)
 3. You can use the gradio demo locally by running [`python -m demos.musicgen_app --share`](../demos/musicgen_app.py).
 4. You can play with MusicGen by running the jupyter notebook at [`demos/musicgen_demo.ipynb`](../demos/musicgen_demo.ipynb) locally (if you have a GPU).
 5. Finally, checkout [@camenduru Colab page](https://github.com/camenduru/MusicGen-colab)
