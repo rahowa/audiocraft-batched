@@ -350,11 +350,11 @@ def ui_full(launch_kwargs):
                     audio_outputs.append(a)
                 df_outputs = []
                 for i in range(MAX_INPUTS):
-                    v = gr.Video(label=f"Generated Music (Diffusion) {i + 1}",  visible=i<DEFAULT_NUM_INPUTS)
+                    v = gr.Video(label=f"Generated Music (Diffusion) {i + 1}",  visible=False)
                     df_outputs.append(v)
                 df_audio_outputs = []
                 for i in range(MAX_INPUTS):
-                    a = gr.Audio(label=f"Generated Music (wav) (Diffusion) {i+1}", type='filepath',  visible=i<DEFAULT_NUM_INPUTS)
+                    a = gr.Audio(label=f"Generated Music (wav) (Diffusion) {i+1}", type='filepath',  visible=False)
                     df_audio_outputs.append(a)
         num_inputs.change(show_num_elements, num_inputs, texts)
         num_inputs.change(show_num_elements, num_inputs, outputs)
