@@ -24,7 +24,7 @@ from audiocraft.data.audio_utils import convert_audio
 from audiocraft.data.audio import audio_write
 from audiocraft.models import MusicGen, MultiBandDiffusion
 
-MAX_INPUTS = 10
+MAX_INPUTS = 30
 MODEL = None  # Last used model
 IS_BATCHED = "facebook/MusicGen" in os.environ.get('SPACE_ID', '')
 USE_BATCHED_INFERENCE = os.environ.get('USE_BATCHED_INFERENCE', False)
