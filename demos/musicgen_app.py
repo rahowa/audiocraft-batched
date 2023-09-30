@@ -30,6 +30,7 @@ IS_BATCHED = "facebook/MusicGen" in os.environ.get('SPACE_ID', '')
 USE_BATCHED_INFERENCE = os.environ.get('USE_BATCHED_INFERENCE', False)
 
 print(IS_BATCHED)
+DEFAULT_NUM_INPUTS = 10
 MAX_BATCH_SIZE = 12
 BATCHED_DURATION = 15
 INTERRUPTING = False
@@ -308,11 +309,11 @@ def ui_full(launch_kwargs):
         )
         with gr.Row():
             with gr.Column():
-                num_inputs = gr.Slider(1, MAX_INPUTS, value=3, step=1, label="How many text inputs to show:")
+                num_inputs = gr.Slider(1, MAX_INPUTS, value=DEFAULT_NUM_INPUTS, step=1, label="How many text inputs to show:")
                 with gr.Row():
                     texts = []
                     for i in range(MAX_INPUTS):
-                        t = gr.Text(label=f"Input Text {i}", interactive=True, visible=i<3)
+                        t = gr.Text(label=f"Input Text {i + 1}", interactive=True, visible=i<DEFAULT_NUM_INPUTS)
                         texts.append(t)
                     
                     with gr.Column():
@@ -341,19 +342,19 @@ def ui_full(launch_kwargs):
             with gr.Column():
                 outputs = []
                 for i in range(MAX_INPUTS):
-                    v = gr.Video(label="Generated Music",  visible=i<3)
+                    v = gr.Video(label=f"Generated Music {i+1}",  visible=i<DEFAULT_NUM_INPUTS)
                     outputs.append(v)
                 audio_outputs = []
                 for i in range(MAX_INPUTS):
-                    a = gr.Audio(label="Generated Music (wav)", type='filepath',  visible= i < 3)
+                    a = gr.Audio(label=f"Generated Music (wav) {i+1}", type='filepath',  visible=i<DEFAULT_NUM_INPUTS)
                     audio_outputs.append(a)
                 df_outputs = []
                 for i in range(MAX_INPUTS):
-                    v = gr.Video(label="Generated Music (Diffusion)",  visible=i<3)
+                    v = gr.Video(label=f"Generated Music (Diffusion) {i + 1}",  visible=i<DEFAULT_NUM_INPUTS)
                     df_outputs.append(v)
                 df_audio_outputs = []
                 for i in range(MAX_INPUTS):
-                    a = gr.Audio(label="Generated Music (wav) (Diffusion)", type='filepath',  visible= i < 3)
+                    a = gr.Audio(label=f"Generated Music (wav) (Diffusion) {i+1}", type='filepath',  visible=i<DEFAULT_NUM_INPUTS)
                     df_audio_outputs.append(a)
         num_inputs.change(show_num_elements, num_inputs, texts)
         num_inputs.change(show_num_elements, num_inputs, outputs)
