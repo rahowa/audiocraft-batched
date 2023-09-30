@@ -27,6 +27,8 @@ from audiocraft.models import MusicGen, MultiBandDiffusion
 MAX_INPUTS = 10
 MODEL = None  # Last used model
 IS_BATCHED = "facebook/MusicGen" in os.environ.get('SPACE_ID', '')
+USE_BATCHED_INFERENCE = os.environ.get('USE_BATCHED_INFERENCE', False)
+
 print(IS_BATCHED)
 MAX_BATCH_SIZE = 12
 BATCHED_DURATION = 15
@@ -197,7 +199,7 @@ def predict_full_multiple(model, decoder, melody, duration, topk, topp, temperat
     global USE_DIFFUSION
     INTERRUPTING = False
     valid_texts = [t for t in texts if t != ""]
-
+    num_empty_outputs = len(texts) - len(valid_texts)
     if temperature < 0:
         raise gr.Error("Temperature must be >= 0.")
     if topk < 0:
@@ -219,20 +221,56 @@ def predict_full_multiple(model, decoder, melody, duration, topk, topp, temperat
             raise gr.Error("Interrupted.")
     MODEL.set_custom_progress_callback(_progress)
 
-    videos, wavs = _do_predictions(
-        valid_texts, [melody], duration, progress=True,
-        top_k=topk, top_p=topp, temperature=temperature, cfg_coef=cfg_coef)
-    if USE_DIFFUSION:
-        out_videos = videos[:len(valid_texts)] + [None for _ in range(len(texts) - len(valid_texts))]
-        out_wavs = wavs[:len(valid_texts)] + [None for _ in range(len(texts) - len(valid_texts))]
-        out_videos_df = videos[len(valid_texts):] + [None for _ in range(len(texts) - len(valid_texts))]
-        out_wavs_df = wavs[len(valid_texts):] + [None for _ in range(len(texts) - len(valid_texts))]
-        return out_videos + out_wavs + out_videos_df + out_wavs_df
-    return (
-        videos + [None for _ in range(len(texts) - len(valid_texts))]
-        + wavs + [None for _ in range(len(texts) - len(valid_texts))]
-        + [None] * 2 * len(texts)
-    )
+    if USE_BATCHED_INFERENCE:
+        videos, wavs = _do_predictions(
+            valid_texts, [melody], duration, progress=True,
+            top_k=topk, top_p=topp, temperature=temperature, cfg_coef=cfg_coef)
+        if USE_DIFFUSION:
+            out_videos = videos + [None] * num_empty_outputs
+            out_wavs = wavs + [None] * num_empty_outputs
+            out_videos_df = videos + [None] * num_empty_outputs
+            out_wavs_df = wavs + [None] * num_empty_outputs
+            return out_videos + out_wavs + out_videos_df + out_wavs_df
+        return (
+            videos + [None] * num_empty_outputs
+            + wavs + [None] * num_empty_outputs
+            + [None] * 2 * len(texts)
+        )
+    else:
+        if USE_DIFFUSION:
+            videos = []
+            wavs = []
+            df_videos = []
+            df_wavs = []
+            for text in valid_texts:
+                videos_i, wavs_i = _do_predictions(
+                    [text], [melody], duration, progress=True,
+                    top_k=topk, top_p=topp, temperature=temperature, cfg_coef=cfg_coef
+                )
+                videos.append(videos_i[0])
+                df_videos.append(videos_i[1])
+                wavs.append(wavs_i[0])
+                df_wavs.append(wavs_i[1])
+            videos += [None] * num_empty_outputs
+            wavs += [None] * num_empty_outputs
+            df_videos += [None] * num_empty_outputs
+            df_wavs += [None] * num_empty_outputs
+            return videos + wavs + df_videos + df_wavs
+        else:
+            videos = []
+            wavs = []
+            for text in valid_texts:
+                videos_i, wavs_i = _do_predictions(
+                    [text], [melody], duration, progress=True,
+                    top_k=topk, top_p=topp, temperature=temperature, cfg_coef=cfg_coef
+                )
+                videos.append(videos_i[0])
+                wavs.append(wavs_i[0])
+        return (
+            videos + [None] * num_empty_outputs
+            + wavs + [None] * num_empty_outputs
+            + [None] * 2 * len(texts)
+        )
     
 
 def toggle_audio_src(choice):
@@ -242,18 +280,19 @@ def toggle_audio_src(choice):
         return gr.update(source="upload", value=None, label="File")
 
 
-def toggle_diffusion(choice):
+def toggle_diffusion(choice, k):
+    k = int(k)
     if choice == "MultiBand_Diffusion":
-        return [gr.update(visible=True)] * 2
+        return ([gr.update(visible=True)] * k + [gr.update(visible=False)] * (MAX_INPUTS - k))*2
     else:
-        return [gr.update(visible=False)] * 2
+        return [gr.update(visible=False)] * MAX_INPUTS * 2
 
 
 
 
 def show_num_elements(k):
     k = int(k)
-    result = [gr.update(visible=True)]*k + [gr.update(visible=False)]*(10-k)
+    result = [gr.update(visible=True)]*k + [gr.update(visible=False)]*(MAX_INPUTS-k)
     return result
 
 
@@ -271,10 +310,9 @@ def ui_full(launch_kwargs):
             with gr.Column():
                 num_inputs = gr.Slider(1, MAX_INPUTS, value=3, step=1, label="How many text inputs to show:")
                 with gr.Row():
-                    text = gr.Text(label="Input Text", interactive=True)
                     texts = []
                     for i in range(MAX_INPUTS):
-                        t = gr.Text(label=f"Input Text {i}", interactive=True, visible= i < 3)
+                        t = gr.Text(label=f"Input Text {i}", interactive=True, visible=i<3)
                         texts.append(t)
                     
                     with gr.Column():
@@ -301,31 +339,26 @@ def ui_full(launch_kwargs):
                     temperature = gr.Number(label="Temperature", value=1.0, interactive=True)
                     cfg_coef = gr.Number(label="Classifier Free Guidance", value=3.0, interactive=True)
             with gr.Column():
-                output = gr.Video(label="Generated Music")
                 outputs = []
                 for i in range(MAX_INPUTS):
-                    v = gr.Video(label="Generated Music",  visible= i < 3)
+                    v = gr.Video(label="Generated Music",  visible=i<3)
                     outputs.append(v)
-                audio_output = gr.Audio(label="Generated Music (wav)", type='filepath')
                 audio_outputs = []
                 for i in range(MAX_INPUTS):
                     a = gr.Audio(label="Generated Music (wav)", type='filepath',  visible= i < 3)
                     audio_outputs.append(a)
-                diffusion_output = gr.Video(label="MultiBand Diffusion Decoder")
-                audio_diffusion = gr.Audio(label="MultiBand Diffusion Decoder (wav)", type='filepath')
                 df_outputs = []
                 for i in range(MAX_INPUTS):
-                    v = gr.Video(label="Generated Music",  visible= i < 3)
+                    v = gr.Video(label="Generated Music (Diffusion)",  visible=i<3)
                     df_outputs.append(v)
-                df_audio_output = gr.Audio(label="Generated Music (wav)", type='filepath')
                 df_audio_outputs = []
                 for i in range(MAX_INPUTS):
-                    a = gr.Audio(label="Generated Music (wav)", type='filepath',  visible= i < 3)
+                    a = gr.Audio(label="Generated Music (wav) (Diffusion)", type='filepath',  visible= i < 3)
                     df_audio_outputs.append(a)
         num_inputs.change(show_num_elements, num_inputs, texts)
         num_inputs.change(show_num_elements, num_inputs, outputs)
         num_inputs.change(show_num_elements, num_inputs, audio_outputs)
-        submit.click(toggle_diffusion, decoder, [diffusion_output, audio_diffusion], queue=False,
+        submit.click(toggle_diffusion, [decoder, num_inputs], [*df_outputs, *df_audio_outputs], queue=False,
                      show_progress=False).then(predict_full_multiple, inputs=[model, decoder, melody, duration, topk, topp, temperature, cfg_coef, *texts],
                                                outputs=[*outputs, *audio_outputs, *df_outputs, *df_audio_outputs])
         radio.change(toggle_audio_src, radio, [melody], queue=False, show_progress=False)
@@ -370,8 +403,8 @@ def ui_full(launch_kwargs):
                     "MultiBand_Diffusion"
                 ],
             ],
-            inputs=[text, melody, model, decoder],
-            outputs=[output]
+            inputs=[texts[0], melody, model, decoder],
+            outputs=[outputs[0]]
         )
         gr.Markdown(
             """
