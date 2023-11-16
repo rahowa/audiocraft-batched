@@ -26,7 +26,9 @@ deadlock:
   use: true  # deadlock detection
 
 dataset:
-  batch_size: 192  # 32 GPUs
+  return_info: true
+  batch_size: 1  # 32 GPUs
+  num_workers: 1
   sample_on_weight: false  # Uniform sampling all the way
   sample_on_duration: false  # Uniform sampling all the way
 
