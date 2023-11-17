@@ -1,3 +1,6 @@
+import bz2
+from pathlib import Path
+import pickle
 from transformers import AutoModelForTextEncoding, AutoModel, MusicgenForCausalLM
 import warnings
 import omegaconf
@@ -277,102 +280,38 @@ def compute_cross_entropy(
 #             metrics[f'ppl_q{k + 1}'] = torch.exp(ce_q)
 
 #         return metrics
-def music_dataloader_wrapper(dataloader: DataLoader, audio_encoder: tp.Callable, device: str = "cuda") -> tp.Iterator[dict[str, torch.Tensor]]:
-    device = audio_encoder.device
-    for batch in dataloader:
-        wavs, infos = batch
-        print(wavs.shape)
-        print([wav[0].size() for wav in wavs])
-        processed = processor(
-            text=[info.description for info in infos],
-            audio=[wav[0].numpy() for wav in wavs],
-            sampling_rate=32_000, #infos[0].self_wav.sample_rate[0],
-            padding=True,
-            return_tensors="pt"
-        )
-        print(f"curr device {device}")
-        audio_encoder_outputs = audio_encoder(
-            input_values=processed["input_values"].to(device),
-            padding_mask=processed["padding_mask"].to(device),
-            # **kwargs_audio_encoder,
-        )
-        audio_codes = audio_encoder_outputs.audio_codes
-        frames, bsz, codebooks, seq_len = audio_codes.shape
-        if frames != 1:
-            raise ValueError(
-                f"Expected 1 frame in the audio code outputs, got {frames} frames. Ensure chunking is "
-                "disabled by setting `chunk_length=None` in the audio encoder."
-            )
-        decoder_input_ids = audio_codes[0, ...].reshape(-1, seq_len).to(processed["input_ids"].device)
-        yield {
-            "input_ids": processed["input_ids"], #.to(device),
-            "attention_mask": processed["attention_mask"], #.to(device),
-            # "labels": processed["input_values"],
-            "labels": decoder_input_ids, #to(device),
-            "padding_mask": processed["padding_mask"] #.to(device),
-        }
-               
-def collate_fn_wrapper(collate_fn, audio_encoder, processor):
-    def wrapper(samples):
-        batch = collate_fn(samples)
-        device = audio_encoder.device
-        wavs, infos = batch
-        processed = processor(
-            text=[info.description for info in infos],
-            audio=[wav[0].numpy() for wav in wavs],
-            sampling_rate=32_000, #infos[0].self_wav.sample_rate[0],
-            padding=True,
-            return_tensors="pt"
-        )
-        try:
-            with torch.inference_mode():
-                audio_encoder_outputs = audio_encoder(
-                    input_values=processed["input_values"].to(device),
-                    padding_mask=processed["padding_mask"].to(device),
-                    # **kwargs_audio_encoder,
-                )
-        except Exception as err:
-            print(err)
-            print([info.description for info in infos])
-            raise err
-            
-        audio_codes = audio_encoder_outputs.audio_codes
-        frames, bsz, codebooks, seq_len = audio_codes.shape
-        if frames != 1:
-            raise ValueError(
-                f"Expected 1 frame in the audio code outputs, got {frames} frames. Ensure chunking is "
-                "disabled by setting `chunk_length=None` in the audio encoder."
-            )
-        decoder_input_ids = audio_codes[0, ...].reshape(-1, seq_len).to(processed["input_ids"].device)
-        return {
-            "input_ids": processed["input_ids"], #.to(device),
-            "attention_mask": processed["attention_mask"], #.to(device),
-            "labels": decoder_input_ids, #to(device),
-            "padding_mask": processed["padding_mask"] #.to(device),
-        }
-    return wrapper
-               
 
-if __name__ == "__main__":
+
+from torch.utils.data import Dataset
+
+class PreparedDataset(Dataset):
+    def  __init__(self, path) -> None:
+        super().__init__()
+        self.path = Path(path) 
+        self.files = list(self.path.iterdir())
+        
+    def __len__(self) -> int:
+        return len(self.files)
     
-    batch_size = 2
+    def read_file(self, filename: tp.Union[str, Path]) -> dict[str, torch.Tensor]:
+        with bz2.BZ2File(filename, "rb") as compressed_data_file:
+            data = pickle.load(compressed_data_file)
+        return data
+        
+    def __getitem__(self, index) -> dict[str, torch.Tensor]:
+        return self.read_file(self.files[index])
+        
+        
+if __name__ == "__main__":
     accelerator = Accelerator(mixed_precision="bf16", cpu=False, device_placement=True)
-    processor: MusicgenProcessor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-    full_model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small")
-    enc_to_dec_proj = full_model.enc_to_dec_proj
-    enc_to_dec_proj.eval()
-    enc_to_dec_proj.requires_grad_(False)
-    enc_to_dec_proj.to(accelerator.device)
-    config = full_model.config
-    generation_config = full_model.generation_config
-    full_model = None
+    decoder = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").decoder
+    config = decoder.config
+    generation_config = decoder.generation_config
     config.device = accelerator.device
     config.decoder_start_token_id = generation_config.decoder_start_token_id
     config.pad_token_id = generation_config.pad_token_id
+    decoder.eval()
 
-    text_encoder = AutoModelForTextEncoding.from_config(config.text_encoder)
-    audio_encoder = AutoModel.from_config(config.audio_encoder)
-    decoder = MusicgenForCausalLM(config.decoder)
     modules_to_lora = [
         name
         for name, _ in decoder.named_modules()
@@ -388,101 +327,66 @@ if __name__ == "__main__":
     )
     
     decoder = get_peft_model(decoder, peft_config)
-    dataloader = get_audio_datasets(cfg, DatasetType.MUSIC)["train"]
-    # decoder.to(accelerator.device)
-    audio_encoder.eval()
-    text_encoder.eval()
-    decoder.train()
-    audio_encoder.to(torch.device("cpu"))
-    # text_encoder.to(accelerator.device)#, dtype=torch.float16)
+    dataset = PreparedDataset("generated_train_dataset")
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=2)
     optimizer = AdamW(decoder.parameters(), lr=1e-5, weight_decay=1e-3)
     loss_fct = torch.nn.CrossEntropyLoss()
-    dataloader.collate_fn = collate_fn_wrapper(dataloader.collate_fn, audio_encoder, processor)
-    text_encoder, decoder, optimizer, dataloader = accelerator.prepare(text_encoder, decoder, optimizer, dataloader)
-    for epoch in range(1):
-        for batch in dataloader:
-                
-            input_ids = batch["input_ids"] #.to(accelerator.device)
-            attention_mask = batch["attention_mask"] #.to(accelerator.device)
-            labels = batch["labels"]
-            
-            del batch
-                
-            print(decoder.device, text_encoder.device)
-            with torch.inference_mode():
-                encoder_outputs = text_encoder(
-                    input_ids=input_ids, #.to(accelerator.device), #.to("cpu"),
-                    attention_mask=attention_mask, #.to(accelerator.device), #.to("cpu"),
-                    # output_hidden_states=True,
-                    return_dict=config.use_return_dict,
+    decoder, optimizer, dataloader = accelerator.prepare(decoder, optimizer, dataloader)
+    with torch.inference_mode():
+        for epoch in range(1):
+            for batch in dataloader:
+                    
+                print("start decoding...")
+                # print(batch.keys())
+                # exit()
+                # decoder.print_trainable_parameters()
+                decoder_outputs = decoder(
+                    input_ids=batch["decoder_input_ids"],
+                    encoder_hidden_states=batch["encoder_hidden_states"],
+                    encoder_attention_mask=batch["attention_mask"]
                 )
-                text_encoder = cpu_offload(text_encoder)
-                print(encoder_outputs[0].shape)
-                encoder_hidden_states = encoder_outputs[0]
-                if (
-                    text_encoder.config.hidden_size != decoder.config.hidden_size
-                    and decoder.config.cross_attention_hidden_size is None
-                ):
-                    encoder_hidden_states = enc_to_dec_proj(encoder_hidden_states)
-
-                if attention_mask is not None:
-                    encoder_hidden_states = encoder_hidden_states * attention_mask[..., None] #.to(accelerator.device)
+                logits = decoder_outputs.logits if config.use_return_dict else decoder_outputs[0]
+                loss = loss_fct(logits.view(-1, config.vocab_size), batch["labels"].view(-1))
                 
-            del input_ids
-            # torch.cuda.empty_cache()
-            # labels = labels.to(accelerator.device)
-            decoder_input_ids = shift_tokens_right(labels, config.pad_token_id, config.decoder_start_token_id)
-            print("start decoding...")
-            decoder.print_trainable_parameters()
-            for param in decoder.parameters():
-                print(param.requires_grad)
-            decoder_outputs = decoder(
-                input_ids=decoder_input_ids,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=attention_mask, #.to(accelerator.device),
-            )
-            logits = decoder_outputs.logits if config.use_return_dict else decoder_outputs[0]
-            loss = loss_fct(logits.view(-1, config.decoder.vocab_size), labels.view(-1))
-            
-            accelerator.backward(loss)
-            optimizer.step()
-            optimizer.zero_grad()
-            print(loss.shape, loss)
-            # res = prepare_tokens_and_attributes(batch, False, condition_provider, compression_model)
+                # accelerator.backward(loss)
+                # optimizer.step()
+                # optimizer.zero_grad()
+                print(f"Loss: {loss}")
+                # res = prepare_tokens_and_attributes(batch, False, condition_provider, compression_model)
+                # break
+                # batch_sample_idx = 0
+                # print(type(batch))
+                # wav, info = batch
+                # print(type(wav), wav.shape, type(info), len(info), type(info[0]))
+                # print(info[0].self_wav.sample_rate[0])
+                # print(wav[batch_sample_idx][0])
+                # res = processor(
+                #     text=["80s pop track with bassy drums and synth"],
+                #     audio=wav[batch_sample_idx][0],
+                #     sampling_rate=info[batch_sample_idx].self_wav.sample_rate[0],
+                #     padding=True,
+                #     return_tensors="pt"
+                # )
+                # print(res)
+                # print(res["input_values"].shape)
+                # audio_encoder_outputs = model.audio_encoder(
+                #     input_values=wav[batch_sample_idx].unsqueeze(0),
+                #     padding_mask=res["padding_mask"],
+                #     # **kwargs_audio_encoder,
+                # )
+                # audio_codes = audio_encoder_outputs.audio_codes
+                # frames, bsz, codebooks, seq_len = audio_codes.shape
+                # if frames != 1:
+                #     raise ValueError(
+                #         f"Expected 1 frame in the audio code outputs, got {frames} frames. Ensure chunking is "
+                #         "disabled by setting `chunk_length=None` in the audio encoder."
+                #     )
+                # decoder_input_ids = audio_codes[0, ...].reshape(bsz * model.decoder.num_codebooks, seq_len)
+                # # print(len(res))
+                # # print(res[0]["description"])
+                # # condition_tensors, audio_tokens, padding_mask = res 
+                # preds = model(**res, labels=decoder_input_ids).loss
+                # print(preds)
+                # print(preds.shape)
+                # break
             # break
-            # batch_sample_idx = 0
-            # print(type(batch))
-            # wav, info = batch
-            # print(type(wav), wav.shape, type(info), len(info), type(info[0]))
-            # print(info[0].self_wav.sample_rate[0])
-            # print(wav[batch_sample_idx][0])
-            # res = processor(
-            #     text=["80s pop track with bassy drums and synth"],
-            #     audio=wav[batch_sample_idx][0],
-            #     sampling_rate=info[batch_sample_idx].self_wav.sample_rate[0],
-            #     padding=True,
-            #     return_tensors="pt"
-            # )
-            # print(res)
-            # print(res["input_values"].shape)
-            # audio_encoder_outputs = model.audio_encoder(
-            #     input_values=wav[batch_sample_idx].unsqueeze(0),
-            #     padding_mask=res["padding_mask"],
-            #     # **kwargs_audio_encoder,
-            # )
-            # audio_codes = audio_encoder_outputs.audio_codes
-            # frames, bsz, codebooks, seq_len = audio_codes.shape
-            # if frames != 1:
-            #     raise ValueError(
-            #         f"Expected 1 frame in the audio code outputs, got {frames} frames. Ensure chunking is "
-            #         "disabled by setting `chunk_length=None` in the audio encoder."
-            #     )
-            # decoder_input_ids = audio_codes[0, ...].reshape(bsz * model.decoder.num_codebooks, seq_len)
-            # # print(len(res))
-            # # print(res[0]["description"])
-            # # condition_tensors, audio_tokens, padding_mask = res 
-            # preds = model(**res, labels=decoder_input_ids).loss
-            # print(preds)
-            # print(preds.shape)
-            # break
-        # break
