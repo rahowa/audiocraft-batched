@@ -1,0 +1,10 @@
+# @package __global__
+
+datasource:
+  max_sample_rate: 32000
+  max_channels: 1
+
+  train: egs/phonk/train
+  valid: egs/phonk/valid
+  evaluate: egs/phonk/valid
+  generate: egs/phonk/valid # identical to evaluate
