@@ -332,26 +332,26 @@ if __name__ == "__main__":
     optimizer = AdamW(decoder.parameters(), lr=1e-5, weight_decay=1e-3)
     loss_fct = torch.nn.CrossEntropyLoss()
     decoder, optimizer, dataloader = accelerator.prepare(decoder, optimizer, dataloader)
-    with torch.inference_mode():
-        for epoch in range(1):
-            for batch in dataloader:
-                    
-                print("start decoding...")
-                # print(batch.keys())
-                # exit()
-                # decoder.print_trainable_parameters()
-                decoder_outputs = decoder(
-                    input_ids=batch["decoder_input_ids"],
-                    encoder_hidden_states=batch["encoder_hidden_states"],
-                    encoder_attention_mask=batch["attention_mask"]
-                )
-                logits = decoder_outputs.logits if config.use_return_dict else decoder_outputs[0]
-                loss = loss_fct(logits.view(-1, config.vocab_size), batch["labels"].view(-1))
+    # with torch.inference_mode():
+    for epoch in range(1):
+        for batch in dataloader:
                 
-                # accelerator.backward(loss)
-                # optimizer.step()
-                # optimizer.zero_grad()
-                print(f"Loss: {loss}")
+            print("start decoding...")
+            # print(batch.keys())
+            # exit()
+            # decoder.print_trainable_parameters()
+            decoder_outputs = decoder(
+                input_ids=batch["decoder_input_ids"],
+                encoder_hidden_states=batch["encoder_hidden_states"],
+                encoder_attention_mask=batch["attention_mask"]
+            )
+            logits = decoder_outputs.logits if config.use_return_dict else decoder_outputs[0]
+            loss = loss_fct(logits.view(-1, config.vocab_size), batch["labels"].view(-1))
+            
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad()
+            print(f"Loss: {loss}")
                 # res = prepare_tokens_and_attributes(batch, False, condition_provider, compression_model)
                 # break
                 # batch_sample_idx = 0
