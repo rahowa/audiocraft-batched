@@ -42,6 +42,7 @@ def collate_fn_wrapper(collate_fn, processor):
     def wrapper(samples):
         batch = collate_fn(samples)
         wavs, infos = batch
+        print([info.description for info in infos])
         return processor(
             text=[info.description or "" for info in infos],
             audio=[wav[0].numpy() for wav in wavs],

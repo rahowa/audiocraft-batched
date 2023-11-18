@@ -1,3 +1,4 @@
+from ast import List
 import bz2
 from pathlib import Path
 import pickle
@@ -294,13 +295,22 @@ class PreparedDataset(Dataset):
         return len(self.files)
     
     def read_file(self, filename: tp.Union[str, Path]) -> dict[str, torch.Tensor]:
-        with bz2.BZ2File(filename, "rb") as compressed_data_file:
-            data = pickle.load(compressed_data_file)
-        return data
+        try:
+            with bz2.BZ2File(filename, "rb") as compressed_data_file:
+                data = pickle.load(compressed_data_file)
+            return data
+        except:
+            print(filename)
         
     def __getitem__(self, index) -> dict[str, torch.Tensor]:
         return self.read_file(self.files[index])
-        
+    
+    
+    # @staticmethod
+    # def collate_fn(samples: List[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    #     res = {}
+    #     for idx, datadict in enumerate(samples):
+            
         
 if __name__ == "__main__":
     accelerator = Accelerator(mixed_precision="bf16", cpu=False, device_placement=True)
@@ -320,7 +330,7 @@ if __name__ == "__main__":
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        r=2,
+        r=32,
         lora_alpha=32,
         lora_dropout=0.1,
         target_modules=modules_to_lora,
@@ -329,11 +339,11 @@ if __name__ == "__main__":
     decoder = get_peft_model(decoder, peft_config)
     dataset = PreparedDataset("generated_train_dataset")
     dataloader = DataLoader(dataset, batch_size=1, num_workers=2)
-    optimizer = AdamW(decoder.parameters(), lr=1e-5, weight_decay=1e-3)
+    optimizer = AdamW(decoder.parameters(), lr=3e-6, weight_decay=5e-3)
     loss_fct = torch.nn.CrossEntropyLoss()
     decoder, optimizer, dataloader = accelerator.prepare(decoder, optimizer, dataloader)
     # with torch.inference_mode():
-    for epoch in range(1):
+    for epoch in range(10):
         for batch in dataloader:
                 
             print("start decoding...")
@@ -352,6 +362,7 @@ if __name__ == "__main__":
             optimizer.step()
             optimizer.zero_grad()
             print(f"Loss: {loss}")
+        decoder.save_pretrained("tuned-musicgen-small-lora")
                 # res = prepare_tokens_and_attributes(batch, False, condition_provider, compression_model)
                 # break
                 # batch_sample_idx = 0
