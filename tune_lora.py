@@ -282,8 +282,10 @@ def compute_cross_entropy(
 
 #         return metrics
 
-
+from typing import List
+import numpy as np
 from torch.utils.data import Dataset
+from collections import defaultdict
 
 class PreparedDataset(Dataset):
     def  __init__(self, path) -> None:
@@ -304,16 +306,34 @@ class PreparedDataset(Dataset):
         
     def __getitem__(self, index) -> dict[str, torch.Tensor]:
         return self.read_file(self.files[index])
+
+    @staticmethod
+    def pad_sequences(samples: List[np.ndarray], pad_value: int) -> List[np.ndarray]:
+        max_len = max(sample.shape[0] for sample in samples)
+        for idx, sample in enumerate(samples):
+            res = np.zeros((max_len, *sample.shape[1:]), dtype=sample.dtype) + pad_value
+            res[:sample.shape[0]] = sample 
+            samples[idx] = res 
+        return samples 
     
-    
-    # @staticmethod
-    # def collate_fn(samples: List[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    #     res = {}
-    #     for idx, datadict in enumerate(samples):
+    @staticmethod
+    def collate_fn(samples: List[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        
+        for idx, att_mask in enumerate(PreparedDataset.pad_sequences([s["attention_mask"] for s in samples], 0)):
+            samples[idx]["attention_mask"] = att_mask
+
+        for idx, ehs in enumerate(PreparedDataset.pad_sequences([s["encoder_hidden_states"] for s in samples], 0)):
+            samples[idx]["encoder_hidden_states"] = ehs
+        res = defaultdict(list)
+        for sample in samples:
+            for k, v in sample.items():
+                #print(v.shape)
+                res[k].append(v)
+        return {k: torch.from_numpy(np.array(v)) for k, v in res.items()}
             
         
 if __name__ == "__main__":
-    accelerator = Accelerator(mixed_precision="bf16", cpu=False, device_placement=True)
+    accelerator = Accelerator()
     decoder = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").decoder
     config = decoder.config
     generation_config = decoder.generation_config
@@ -326,32 +346,38 @@ if __name__ == "__main__":
         name
         for name, _ in decoder.named_modules()
         if name.endswith("q_proj") or name.endswith("v_proj")
-    ]
+    ] + ["lm_heads.0","lm_heads.1", "lm_heads.2", "lm_heads.3"]
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
         r=32,
-        lora_alpha=32,
+        lora_alpha=16,
         lora_dropout=0.1,
         target_modules=modules_to_lora,
     )
-    
+    batch_size = 2
+    epochs = 20
     decoder = get_peft_model(decoder, peft_config)
     dataset = PreparedDataset("generated_train_dataset")
-    dataloader = DataLoader(dataset, batch_size=1, num_workers=2)
-    optimizer = AdamW(decoder.parameters(), lr=3e-6, weight_decay=5e-3)
+    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, collate_fn=dataset.collate_fn)
+    optimizer = AdamW(decoder.parameters(), lr=3e-5, weight_decay=0.1,  betas=(0.9, 0.95))
     loss_fct = torch.nn.CrossEntropyLoss()
-    decoder, optimizer, dataloader = accelerator.prepare(decoder, optimizer, dataloader)
+    from transformers import get_cosine_schedule_with_warmup
+    scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=1000, num_training_steps=int(len(dataloader) * epochs)
+    )
+    decoder, optimizer, dataloader, scheduler = accelerator.prepare(decoder, optimizer, dataloader, scheduler)
     # with torch.inference_mode():
-    for epoch in range(10):
+    for epoch in range(epochs):
         for batch in dataloader:
                 
             print("start decoding...")
             # print(batch.keys())
             # exit()
             # decoder.print_trainable_parameters()
+            #print(batch.keys())
             decoder_outputs = decoder(
-                input_ids=batch["decoder_input_ids"],
+                input_ids=batch["input_ids"],
                 encoder_hidden_states=batch["encoder_hidden_states"],
                 encoder_attention_mask=batch["attention_mask"]
             )
@@ -359,7 +385,9 @@ if __name__ == "__main__":
             loss = loss_fct(logits.view(-1, config.vocab_size), batch["labels"].view(-1))
             
             accelerator.backward(loss)
+            accelerator.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
             print(f"Loss: {loss}")
         decoder.save_pretrained("tuned-musicgen-small-lora")
