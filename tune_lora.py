@@ -1,29 +1,22 @@
-from ast import List
-import bz2
+from functools import partial
+from typing import List
+import numpy as np
+from torch.utils.data import Dataset
+from collections import defaultdict
 from pathlib import Path
-import pickle
-from transformers import AutoModelForTextEncoding, AutoModel, MusicgenForCausalLM
-import warnings
+from transformers import MusicgenForCausalLM
 import omegaconf
 import torch
 import torch.nn.functional as F
 import typing as tp
-from transformers import AutoProcessor, MusicgenForConditionalGeneration, MusicgenProcessor
-from transformers.optimization import AdamW
+from transformers import MusicgenForConditionalGeneration
 
-from transformers.models.musicgen.modeling_musicgen import shift_tokens_right
-from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
-from audiocraft.data.info_audio_dataset import AudioInfo
-from audiocraft.data.music_dataset import MusicDataset, MusicInfo, Paraphraser, augment_music_info_description
+from peft import get_peft_model, LoraConfig, TaskType
 from torch.utils.data import DataLoader
-from audiocraft.models.builders import get_conditioner_provider
 
-from audiocraft.modules.conditioners import AttributeDropout, ClassifierFreeGuidanceDropout, ConditioningAttributes, ConditioningProvider, SegmentWithAttributes, WavCondition
-from audiocraft.solvers.builders import DatasetType, get_audio_datasets
-from audiocraft.solvers.compression import CompressionSolver
-# from audiocraft.utils.cache import CachedBatchLoader, CachedBatchWriter
-from audiocraft.utils.utils import get_dataset_from_loader
-from accelerate import Accelerator, cpu_offload
+from transformers import get_cosine_schedule_with_warmup
+from audiocraft.modules.codebooks_patterns import DelayedPatternProvider
+from accelerate import Accelerator
 
 
 cfg = omegaconf.OmegaConf.merge(
@@ -32,7 +25,7 @@ cfg = omegaconf.OmegaConf.merge(
     omegaconf.OmegaConf.load("config/model/lm/default.yaml"),
     omegaconf.OmegaConf.load("config/solver/compression/default.yaml"),
     omegaconf.OmegaConf.load("config/solver/compression/encodec_musicgen_32khz.yaml"),
-    omegaconf.OmegaConf.load("config/solver/musicgen/musicgen_melody_32khz.yaml"),
+    omegaconf.OmegaConf.load("config/solver/musicgen/musicgen_base_32khz.yaml"),
     omegaconf.OmegaConf.load("config/model/lm/musicgen_lm.yaml"),
     omegaconf.OmegaConf.load("config/config.yaml"),
     omegaconf.OmegaConf.load("config/conditioner/chroma2music.yaml"),
@@ -42,145 +35,12 @@ cfg.dataset.segment_duration = 30
 
 cache_path = "./cache_dir"
 cache_path = None
-use_cached_writer = False
-use_cached_reader = False
-
-cached_batch_writer = None
-cached_batch_loader = None
-# if cache_path is not None and use_cached_writer:
-#     cached_batch_writer = CachedBatchWriter(Path(cache_path))
-# else:
-#     cached_batch_loader = CachedBatchLoader(
-#         Path(cache_path), cfg.dataset.batch_size, cfg.dataset.num_workers,
-#         min_length=cfg.optim.updates_per_epoch or 1)
 
 cfg_dropout_p = 0.1 
 attribute_dropout_p = {"default": 0.1}
-# cfg_dropout = ClassifierFreeGuidanceDropout(p=cfg_dropout_p)
-# att_dropout = AttributeDropout(p=attribute_dropout_p)
 current_stage = "train"
 device = "cpu"
 cfg.device = device
-
-# condition_provider = get_conditioner_provider(cfg["transformer_lm"]["dim"], cfg)
-# compression_model = CompressionSolver.wrapped_model_from_checkpoint(cfg, cfg.compression_model_checkpoint, device=device)
-
-def prepare_tokens_and_attributes(
-    batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]],
-    check_synchronization_points: bool,
-    condition_provider,
-    compression_model,
-    
-) -> tp.Tuple[dict, torch.Tensor, torch.Tensor]:
-    """Prepare input batchs for language model training.
-
-    Args:
-        batch (tuple[torch.Tensor, list[SegmentWithAttributes]]): Input batch with audio tensor of shape [B, C, T]
-            and corresponding metadata as SegmentWithAttributes (with B items).
-        check_synchronization_points (bool): Whether to check for synchronization points slowing down training.
-    Returns:
-        Condition tensors (dict[str, any]): Preprocessed condition attributes.
-        Tokens (torch.Tensor): Audio tokens from compression model, of shape [B, K, T_s],
-            with B the batch size, K the number of codebooks, T_s the token timesteps.
-        Padding mask (torch.Tensor): Mask with valid positions in the tokens tensor, of shape [B, K, T_s].
-    _cached_batch_loader = None
-    er = None"""
-    if model.training:
-        warnings.warn(
-            "Up to version 1.0.1, the _prepare_tokens_and_attributes was evaluated with `torch.no_grad()`. "
-            "This is inconsistent with how model were trained in the MusicGen paper. We removed the "
-            "`torch.no_grad()` in version 1.1.0. Small changes to the final performance are expected. "
-            "Really sorry about that."
-        )
-    if cached_batch_loader is None or current_stage != "train":
-        audio, infos = batch
-        audio = audio.to(device)
-        audio_tokens = None
-        assert audio.size(0) == len(infos), (
-            f"Mismatch between number of items in audio batch ({audio.size(0)})",
-            f" and in metadata ({len(infos)})",
-        )
-    else:
-        audio = None
-        # In that case the batch will be a tuple coming from the _cached_batch_writer bit below.
-        (infos,) = batch  # type: ignore
-        assert all([isinstance(info, AudioInfo) for info in infos])
-        assert all([info.audio_tokens is not None for info in infos])  # type: ignore
-        audio_tokens = torch.stack([info.audio_tokens for info in infos]).to(device)  # type: ignore
-        audio_tokens = audio_tokens.long()
-        for info in infos:
-            if isinstance(info, MusicInfo):
-                # Careful here, if you want to use this condition_wav (e.b. chroma conditioning),
-                # then you must be using the chroma cache! otherwise the code will try
-                # to use this segment and fail (by that I mean you will see NaN everywhere).
-                info.wav = WavCondition(
-                    torch.full([1, info.channels, info.total_frames], float("NaN")),
-                    length=torch.tensor([info.n_frames]),
-                    sample_rate=[info.sample_rate],
-                    path=[info.meta.path],
-                    seek_time=[info.seek_time],
-                )
-                dataset = get_dataset_from_loader(dataloader)
-                assert isinstance(dataset, MusicDataset), type(dataset)
-                if dataset.paraphraser is not None and info.description is not None:
-                    # Hackingly reapplying paraphraser when using cache.
-                    info.description = dataset.paraphraser.sample_paraphrase(
-                        info.meta.path, info.description
-                    )
-    # prepare attributes
-    attributes = [info.to_condition_attributes() for info in infos]
-    print(attributes[0])
-    # attributes = cfg_dropout(attributes)
-    # attributes = att_dropout(attributes)
-    tokenized = condition_provider.tokenize(attributes)
-    # Now we should be synchronization free.
-    if device == "cuda" and check_synchronization_points:
-        torch.cuda.set_sync_debug_mode("warn")
-
-    if audio_tokens is None:
-        with torch.no_grad():
-            audio_tokens, scale = compression_model.encode(audio)
-            assert scale is None, "Scaled compression model not supported with LM."
-
-    # with autocast:
-    condition_tensors = condition_provider(tokenized)
-
-    # create a padding mask to hold valid vs invalid positions
-    padding_mask = torch.ones_like(
-        audio_tokens, dtype=torch.bool, device=audio_tokens.device
-    )
-    # replace encodec tokens from padded audio with special_token_id
-    if cfg.tokens.padding_with_special_token:
-        audio_tokens = audio_tokens.clone()
-        padding_mask = padding_mask.clone()
-        token_sample_rate = compression_model.frame_rate
-        B, K, T_s = audio_tokens.shape
-        for i in range(B):
-            n_samples = infos[i].n_frames
-            audio_sample_rate = infos[i].sample_rate
-            # take the last token generated from actual audio frames (non-padded audio)
-            valid_tokens = math.floor(
-                float(n_samples) / audio_sample_rate * token_sample_rate
-            )
-            audio_tokens[i, :, valid_tokens:] = model.special_token_id
-            padding_mask[i, :, valid_tokens:] = 0
-
-    if device == "cuda" and check_synchronization_points:
-        torch.cuda.set_sync_debug_mode("default")
-
-    if cached_batch_writer is not None and current_stage == "train":
-        assert cached_batch_loader is None
-        assert audio_tokens is not None
-        for info, one_audio_tokens in zip(infos, audio_tokens):
-            assert isinstance(info, AudioInfo)
-            if isinstance(info, MusicInfo):
-                assert not info.joint_embed, "joint_embed and cache not supported yet."
-                info.wav = None
-            assert one_audio_tokens.max() < 2**15, one_audio_tokens.max().item()
-            info.audio_tokens = one_audio_tokens.short().cpu()
-        cached_batch_writer.save(infos)
-
-    return condition_tensors, audio_tokens, padding_mask
 
 
 def compute_cross_entropy(
@@ -220,73 +80,6 @@ def compute_cross_entropy(
     return ce, ce_per_codebook
 
 
-# def run_step( idx: int, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]], metrics: dict) -> dict:
-#         """Perform one training or valid step on a given batch."""
-#         check_synchronization_points = idx == 1 and device == 'cuda'
-
-#         condition_tensors, audio_tokens, padding_mask = _prepare_tokens_and_attributes(
-#             batch, check_synchronization_points)
-
-
-#         if check_synchronization_points:
-#             torch.cuda.set_sync_debug_mode('warn')
-
-#         with autocast:
-#             model_output = model.compute_predictions(audio_tokens, [], condition_tensors)  # type: ignore
-#             logits = model_output.logits
-#             mask = padding_mask & model_output.mask
-#             ce, ce_per_codebook = _compute_cross_entropy(logits, audio_tokens, mask)
-#             loss = ce
-#         deadlock_detect.update('loss')
-
-#         if check_synchronization_points:
-#             torch.cuda.set_sync_debug_mode('default')
-
-#         if is_training:
-#             metrics['lr'] = optimizer.param_groups[0]['lr']
-#             if scaler is not None:
-#                 loss = scaler.scale(loss)
-#             deadlock_detect.update('scale')
-#             if cfg.fsdp.use:
-#                 loss.backward()
-
-#             if scaler is not None:
-#                 scaler.unscale_(optimizer)
-#             if cfg.optim.max_norm:
-#                 if cfg.fsdp.use:
-#                     metrics['grad_norm'] = model.clip_grad_norm_(cfg.optim.max_norm)  # type: ignore
-#                 else:
-#                     metrics['grad_norm'] = torch.nn.utils.clip_grad_norm_(
-#                         model.parameters(), cfg.optim.max_norm
-#                     )
-#             if scaler is None:
-#                 optimizer.step()
-#             else:
-#                 scaler.step(optimizer)
-#                 scaler.update()
-#             if lr_scheduler:
-#                 lr_scheduler.step()
-#             optimizer.zero_grad()
-#             deadlock_detect.update('optim')
-#             if scaler is not None:
-#                 scale = scaler.get_scale()
-#                 metrics['grad_scale'] = scale
-#             if not loss.isfinite().all():
-#                 raise RuntimeError("Model probably diverged.")
-
-#         metrics['ce'] = ce
-#         metrics['ppl'] = torch.exp(ce)
-#         for k, ce_q in enumerate(ce_per_codebook):
-#             metrics[f'ce_q{k + 1}'] = ce_q
-#             metrics[f'ppl_q{k + 1}'] = torch.exp(ce_q)
-
-#         return metrics
-
-from typing import List
-import numpy as np
-from torch.utils.data import Dataset
-from collections import defaultdict
-
 class PreparedDataset(Dataset):
     def  __init__(self, path) -> None:
         super().__init__()
@@ -298,14 +91,17 @@ class PreparedDataset(Dataset):
     
     def read_file(self, filename: tp.Union[str, Path]) -> dict[str, torch.Tensor]:
         try:
-            with bz2.BZ2File(filename, "rb") as compressed_data_file:
-                data = pickle.load(compressed_data_file)
-            return data
+            # with bz2.BZ2File(filename, "rb") as compressed_data_file:
+            #     data = pickle.load(compressed_data_file)
+            # return data
+            return np.load(filename)
         except:
             print(filename)
         
     def __getitem__(self, index) -> dict[str, torch.Tensor]:
-        return self.read_file(self.files[index])
+        values = dict(self.read_file(self.files[index]))
+        # print(values.keys())
+        return values
 
     @staticmethod
     def pad_sequences(samples: List[np.ndarray], pad_value: int) -> List[np.ndarray]:
@@ -317,31 +113,69 @@ class PreparedDataset(Dataset):
         return samples 
     
     @staticmethod
-    def collate_fn(samples: List[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    def collate_fn(samples: List[dict[str, torch.Tensor]], use_cls: bool = False) -> dict[str, torch.Tensor]:
         
-        for idx, att_mask in enumerate(PreparedDataset.pad_sequences([s["attention_mask"] for s in samples], 0)):
-            samples[idx]["attention_mask"] = att_mask
+        for idx, att_mask in enumerate(PreparedDataset.pad_sequences([s["encoder_attention_mask"] for s in samples], 0)):
+            samples[idx]["encoder_attention_mask"] = att_mask
 
         for idx, ehs in enumerate(PreparedDataset.pad_sequences([s["encoder_hidden_states"] for s in samples], 0)):
             samples[idx]["encoder_hidden_states"] = ehs
+
+        if use_cls:
+            for idx, att_mask in enumerate(PreparedDataset.pad_sequences([s["encoder_attention_mask_cls"] for s in samples], 0)):
+                samples[idx]["encoder_attention_mask_cls"] = att_mask
+                
+            for idx, ehs in enumerate(PreparedDataset.pad_sequences([s["encoder_hidden_states_cls"] for s in samples], 0)):
+                samples[idx]["encoder_hidden_states_cls"] = ehs
+
         res = defaultdict(list)
         for sample in samples:
             for k, v in sample.items():
-                #print(v.shape)
                 res[k].append(v)
         return {k: torch.from_numpy(np.array(v)) for k, v in res.items()}
-            
         
-if __name__ == "__main__":
-    accelerator = Accelerator()
-    decoder = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").decoder
-    config = decoder.config
-    generation_config = decoder.generation_config
-    config.device = accelerator.device
-    config.decoder_start_token_id = generation_config.decoder_start_token_id
-    config.pad_token_id = generation_config.pad_token_id
-    decoder.eval()
+            
+def compute_predictions(decoder, generation_config, pattern_provider, batch):
+    codes = batch["labels"]
+    B, K, T = codes.shape
+    codes = codes.contiguous()
+    # map codes [B, K, T] into pattern sequence [B, K, S] using special_token_id for masked tokens
+    pattern = pattern_provider.get_pattern(T)
+    sequence_codes, sequence_indexes, sequence_mask = pattern.build_pattern_sequence(
+        codes, generation_config.decoder_start_token_id, keep_only_valid_steps=True
+    )
+    # apply model on pattern sequence
+    logits = decoder(
+        input_ids=sequence_codes,
+        encoder_hidden_states=batch["encoder_hidden_states"],
+        encoder_attention_mask=batch["encoder_attention_mask"]
+    ).logits
+    logits = logits.view(B, K, logits.size(1), logits.size(2))
+    # map back the logits on pattern sequence to logits on original codes: [B, K, S, card] -> [B, K, T, card]
+    # and provide the corresponding mask over invalid positions of tokens
+    logits = logits.permute(0, 3, 1, 2)  # [B, card, K, S]
+    # note: we use nans as special token to make it obvious if we feed unexpected logits
+    logits, logits_indexes, logits_mask = pattern.revert_pattern_logits(
+        logits, float('nan'), keep_only_valid_steps=True
+    )
+    logits = logits.permute(0, 2, 3, 1)  # [B, K, T, card]
+    logits_mask = logits_mask[None, :, :].expand(B, -1, -1)  # [K, T] -> [B, K, T]
+    return logits, logits_mask
 
+
+def main():
+    accelerator = Accelerator(mixed_precision="fp16")
+    full_model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").to("cpu")
+    decoder: MusicgenForCausalLM = full_model.decoder.to(accelerator.device)
+    decoder.train()
+    full_config = full_model.config
+    generation_config = full_model.generation_config
+    del full_model
+    config = decoder.config
+    config.device = accelerator.device
+    config.decoder_start_token_id = full_config.decoder_start_token_id
+    config.pad_token_id = generation_config.pad_token_id
+    pattern_provider = DelayedPatternProvider(4, delays=[0, 1, 2, 3])
     modules_to_lora = [
         name
         for name, _ in decoder.named_modules()
@@ -350,82 +184,59 @@ if __name__ == "__main__":
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        r=32,
-        lora_alpha=16,
+        r=16,
+        lora_alpha=32,
         lora_dropout=0.1,
         target_modules=modules_to_lora,
     )
-    batch_size = 2
-    epochs = 20
+    batch_size = 1
+    epochs = 2
+    use_cls_loss = True
     decoder = get_peft_model(decoder, peft_config)
     dataset = PreparedDataset("generated_train_dataset")
-    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, collate_fn=dataset.collate_fn)
-    optimizer = AdamW(decoder.parameters(), lr=3e-5, weight_decay=0.1,  betas=(0.9, 0.95))
+    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=8, collate_fn=partial(dataset.collate_fn, use_cls=use_cls_loss))
+    optimizer = torch.optim.AdamW(decoder.parameters(), lr=3e-4, weight_decay=0.01,  betas=(0.9, 0.95))
     loss_fct = torch.nn.CrossEntropyLoss()
-    from transformers import get_cosine_schedule_with_warmup
     scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=1000, num_training_steps=int(len(dataloader) * epochs)
+            optimizer, num_warmup_steps=int(len(dataloader) * epochs * 0.1), num_training_steps=int(len(dataloader) * epochs)
     )
     decoder, optimizer, dataloader, scheduler = accelerator.prepare(decoder, optimizer, dataloader, scheduler)
-    # with torch.inference_mode():
     for epoch in range(epochs):
+        decoder.train()
         for batch in dataloader:
-                
-            print("start decoding...")
-            # print(batch.keys())
-            # exit()
-            # decoder.print_trainable_parameters()
-            #print(batch.keys())
-            decoder_outputs = decoder(
-                input_ids=batch["input_ids"],
-                encoder_hidden_states=batch["encoder_hidden_states"],
-                encoder_attention_mask=batch["attention_mask"]
-            )
-            logits = decoder_outputs.logits if config.use_return_dict else decoder_outputs[0]
-            loss = loss_fct(logits.view(-1, config.vocab_size), batch["labels"].view(-1))
-            
-            accelerator.backward(loss)
-            accelerator.clip_grad_norm_(decoder.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            print(f"Loss: {loss}")
-        decoder.save_pretrained("tuned-musicgen-small-lora")
-                # res = prepare_tokens_and_attributes(batch, False, condition_provider, compression_model)
-                # break
-                # batch_sample_idx = 0
-                # print(type(batch))
-                # wav, info = batch
-                # print(type(wav), wav.shape, type(info), len(info), type(info[0]))
-                # print(info[0].self_wav.sample_rate[0])
-                # print(wav[batch_sample_idx][0])
-                # res = processor(
-                #     text=["80s pop track with bassy drums and synth"],
-                #     audio=wav[batch_sample_idx][0],
-                #     sampling_rate=info[batch_sample_idx].self_wav.sample_rate[0],
-                #     padding=True,
-                #     return_tensors="pt"
-                # )
-                # print(res)
-                # print(res["input_values"].shape)
-                # audio_encoder_outputs = model.audio_encoder(
-                #     input_values=wav[batch_sample_idx].unsqueeze(0),
-                #     padding_mask=res["padding_mask"],
-                #     # **kwargs_audio_encoder,
-                # )
-                # audio_codes = audio_encoder_outputs.audio_codes
-                # frames, bsz, codebooks, seq_len = audio_codes.shape
-                # if frames != 1:
-                #     raise ValueError(
-                #         f"Expected 1 frame in the audio code outputs, got {frames} frames. Ensure chunking is "
-                #         "disabled by setting `chunk_length=None` in the audio encoder."
-                #     )
-                # decoder_input_ids = audio_codes[0, ...].reshape(bsz * model.decoder.num_codebooks, seq_len)
-                # # print(len(res))
-                # # print(res[0]["description"])
-                # # condition_tensors, audio_tokens, padding_mask = res 
-                # preds = model(**res, labels=decoder_input_ids).loss
-                # print(preds)
-                # print(preds.shape)
-                # break
-            # break
+            with accelerator.accumulate(decoder):
+                print("start decoding...")
+                for k, v in batch.items():
+                    if v.dtype == torch.float:
+                        batch[k] = v.half()
+                logits, logits_mask = compute_predictions(decoder, generation_config, pattern_provider, batch)
+                mask = torch.ones_like(batch["labels"]) & logits_mask
+                loss, _ = compute_cross_entropy(logits, batch["labels"].long(), mask)
+                if use_cls_loss:
+                    decoder_outputs_cls = dict(
+                        labels=batch["labels"],
+                        encoder_hidden_states=batch["encoder_hidden_states_cls"],
+                        encoder_attention_mask=batch["encoder_attention_mask_cls"]   
+                    )
+                    logits_cls, _ = compute_predictions(decoder, generation_config, pattern_provider, decoder_outputs_cls)
+                    loss_cls = loss_fct(logits_cls.view(-1, config.vocab_size), batch["logits_cls"].view(-1, config.vocab_size).softmax(dim=1))
+                    print(f"Loss cls: {loss_cls}")
+                    loss = loss + loss_cls
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(decoder.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                print(f"Loss: {loss}")
+        decoder.eval()
+        accelerator.unwrap_model(decoder).save_pretrained(f"tuned-musicgen-small-lora-{epoch}")
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        decoder.eval()
+        accelerator.unwrap_model(decoder).save_pretrained("tuned-musicgen-small-lora")
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    main()

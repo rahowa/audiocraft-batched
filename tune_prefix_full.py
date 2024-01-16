@@ -334,29 +334,29 @@ class PreparedDataset(Dataset):
         
 if __name__ == "__main__":
     accelerator = Accelerator()
-    decoder = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").decoder
-    config = decoder.config
-    generation_config = decoder.generation_config
+    full_model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small")
+    config = full_model.config
+    generation_config = full_model.decoder.generation_config
     config.device = accelerator.device
     config.decoder_start_token_id = generation_config.decoder_start_token_id
     config.pad_token_id = generation_config.pad_token_id
     peft_config = PrefixTuningConfig(
-        task_type=TaskType.CAUSAL_LM,
+        task_type=TaskType.SEQ_2_SEQ_LM,
         inference_mode=False,
-        num_virtual_tokens=10
+        num_virtual_tokens=20
     )
     batch_size = 2
     epochs = 3
-    decoder = get_peft_model(decoder, peft_config)
+    full_model = get_peft_model(full_model, peft_config)
     dataset = PreparedDataset("generated_train_dataset")
     dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, collate_fn=dataset.collate_fn)
-    optimizer = AdamW(decoder.parameters(), lr=3e-3, weight_decay=0.01,  betas=(0.9, 0.95))
+    optimizer = AdamW(full_model.parameters(), lr=3e-4, weight_decay=0.01,  betas=(0.9, 0.95))
     loss_fct = torch.nn.CrossEntropyLoss()
     from transformers import get_cosine_schedule_with_warmup
     scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=1000, num_training_steps=int(len(dataloader) * epochs)
     )
-    decoder, optimizer, dataloader, scheduler = accelerator.prepare(decoder, optimizer, dataloader, scheduler)
+    decoder, optimizer, dataloader, scheduler = accelerator.prepare(full_model, optimizer, dataloader, scheduler)
     # with torch.inference_mode():
     for epoch in range(epochs):
         for batch in dataloader:
